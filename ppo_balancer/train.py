@@ -3,25 +3,27 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2023 Inria
+#
+# Version modifiée : entraînement sans pybullet (utilise CartPole-v1 comme fallback)
 
 import argparse
 import datetime
+import sys
 import os
 import random
+import string
 import shutil
 import signal
 import tempfile
 from pathlib import Path
 from typing import Callable, List
+import importlib.util
 
 import gin
 import gymnasium
 import numpy as np
 import stable_baselines3
-import upkie.envs
-import upkie.envs.rewards
 from define_reward import DefineReward
-from rules_python.python.runfiles import runfiles
 from settings import EnvSettings, PPOSettings, TrainingSettings
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.logger import TensorBoardOutputFormat
@@ -31,19 +33,11 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from torch import nn
 from upkie.utils.spdlog import logging
-from wrap_velocity_env import wrap_velocity_env
-
-upkie.envs.register()
 
 TRAINING_PATH = os.environ.get("UPKIE_TRAINING_PATH", tempfile.gettempdir())
 
 
 def parse_command_line_arguments() -> argparse.Namespace:
-    """Parse command line arguments.
-
-    Returns:
-        Command-line arguments.
-    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--name",
@@ -61,7 +55,7 @@ def parse_command_line_arguments() -> argparse.Namespace:
         "--show",
         default=False,
         action="store_true",
-        help="show simulator during trajectory rollouts",
+        help="show simulator during trajectory rollouts (ignored for CartPole fallback)",
     )
     return parser.parse_args()
 
@@ -83,14 +77,20 @@ class InitRandomizationCallback(BaseCallback):
         self.vec_env = vec_env
 
     def _on_step(self) -> bool:
+        # schedule progress in [0,1]
         progress: float = np.clip(
             (self.num_timesteps - self.start_timestep) / self.end_timestep,
             0.0,
             1.0,
         )
         cur_value = progress * self.max_value
-        self.vec_env.env_method("update_init_rand", **{self.key: cur_value})
-        self.logger.record(f"init_rand/{self.key}", cur_value)
+        # try to call update_init_rand if env implements it
+        try:
+            self.vec_env.env_method("update_init_rand", **{self.key: cur_value})
+            self.logger.record(f"init_rand/{self.key}", cur_value)
+        except Exception:
+            # environment doesn't provide this hook: silently ignore
+            pass
         return True
 
 
@@ -100,15 +100,22 @@ class RewardCallback(BaseCallback):
         self.vec_env = vec_env
 
     def _on_step(self) -> bool:
-        for term in (
-            "position_reward",
-            "velocity_penalty",
-            "action_change_penalty",
-        ):
-            reward = np.mean(self.vec_env.get_attr(f"last_{term}"))
-            self.logger.record(f"rewards/{term}", reward)
-        reward = np.mean(self.vec_env.get_attr("last_reward"))
-        self.logger.record("rewards/reward", reward)
+        # Attempt to log env-specific reward components if they exist.
+        for term in ("position_reward", "velocity_penalty", "action_change_penalty"):
+            try:
+                vals = self.vec_env.get_attr(f"last_{term}")
+                reward = np.mean(vals) if len(vals) > 0 else 0.0
+                self.logger.record(f"rewards/{term}", reward)
+            except Exception:
+                # attribute not present on the environment
+                pass
+        try:
+            last_rewards = self.vec_env.get_attr("last_reward")
+            reward = np.mean(last_rewards) if len(last_rewards) > 0 else 0.0
+            self.logger.record("rewards/reward", reward)
+        except Exception:
+            # fallback: nothing to log
+            pass
         return True
 
 
@@ -121,9 +128,8 @@ class SummaryWriterCallback(BaseCallback):
     def _on_training_start(self):
         output_formats = self.logger.output_formats
         self.tb_formatter = next(
-            formatter
-            for formatter in output_formats
-            if isinstance(formatter, TensorBoardOutputFormat)
+            (formatter for formatter in output_formats if isinstance(formatter, TensorBoardOutputFormat)),
+            None,
         )
 
     def _on_step(self) -> bool:
@@ -132,14 +138,16 @@ class SummaryWriterCallback(BaseCallback):
         if self.n_calls != 1:
             return True
 
+        # Use a dummy env to instantiate DefineReward for gin operative config
         with gymnasium.make("CartPole-v1") as dummy_env:
             _ = DefineReward(dummy_env)  # for the gin operative config
         print("Gin operative config:", gin.operative_config_str())
-        self.tb_formatter.writer.add_text(
-            "gin/operative_config",
-            gin.operative_config_str(),
-            global_step=None,
-        )
+        if self.tb_formatter:
+            self.tb_formatter.writer.add_text(
+                "gin/operative_config",
+                gin.operative_config_str(),
+                global_step=None,
+            )
         gin_path = f"{self.save_path}/operative_config.gin"
         with open(gin_path, "w") as fh:
             fh.write(gin.operative_config_str())
@@ -148,83 +156,36 @@ class SummaryWriterCallback(BaseCallback):
 
 
 def get_random_word():
-    with open("/usr/share/dict/words") as fh:
-        words = fh.read().splitlines()
-    word_index = random.randint(0, len(words))
-    while not words[word_index].isalnum():
-        word_index = (word_index + 1) % len(words)
-    return words[word_index]
+    letters = string.ascii_lowercase
+    return "".join(random.choice(letters) for _ in range(8))
 
 
-def get_bullet_argv(shm_name: str, show: bool) -> List[str]:
-    """Get command-line arguments for the Bullet spine.
-
-    Args:
-        shm_name: Name of the shared-memory file.
-        show: If true, show simulator GUI.
-
-    Returns:
-        Command-line arguments.
+def init_env(max_episode_duration: float, show: bool, spine_path: str = ""):
     """
-    env_settings = EnvSettings()
-    agent_frequency = env_settings.agent_frequency
-    spine_frequency = env_settings.spine_frequency
-    assert spine_frequency % agent_frequency == 0
-    nb_substeps = spine_frequency / agent_frequency
-    bullet_argv = []
-    bullet_argv.extend(["--shm-name", shm_name])
-    bullet_argv.extend(["--nb-substeps", str(nb_substeps)])
-    bullet_argv.extend(["--spine-frequency", str(spine_frequency)])
-    if show:
-        bullet_argv.append("--show")
-    return bullet_argv
-
-
-def init_env(
-    max_episode_duration: float,
-    show: bool,
-    spine_path: str,
-):
-    """Get an environment initialization function for a set of parameters.
-
-    Args:
-        max_episode_duration: Maximum duration of an episode, in seconds.
-        show: If true, show simulator GUI.
-        spine_path: Path to the Bullet spine binary.
+    Initialization factory WITHOUT pybullet/spine.
+    Uses CartPole-v1 as a simple Gym fallback environment.
+    If you have a pure-Python environment (Gym-compatible) replace 'CartPole-v1' by its id.
     """
     env_settings = EnvSettings()
     seed = random.randint(0, 1_000_000)
 
     def _init():
-        shm_name = f"/{get_random_word()}"
-        pid = os.fork()
-        if pid == 0:  # child process: spine
-            argv = get_bullet_argv(shm_name, show=show)
-            os.execvp(spine_path, ["bullet"] + argv)
-            return
+        # create a Gym environment; adjust max steps using agent_frequency if available
+        try:
+            agent_frequency = env_settings.agent_frequency
+            max_steps = int(max_episode_duration * agent_frequency)
+        except Exception:
+            max_steps = None
 
-        # parent process: trainer
-        agent_frequency = env_settings.agent_frequency
-        velocity_env = gymnasium.make(
-            env_settings.env_id,
-            max_episode_steps=int(max_episode_duration * agent_frequency),
-            frequency=agent_frequency,
-            regulate_frequency=False,
-            shm_name=shm_name,
-            spine_config=env_settings.spine_config,
-            max_ground_velocity=env_settings.max_ground_velocity,
-        )
-        velocity_env.reset(seed=seed)
-        velocity_env._prepatch_close = velocity_env.close
+        # Create CartPole with a max_episode_steps override when possible
+        if max_steps is not None:
+            # Gymnasium accepts max_episode_steps as an argument to make
+            env = gymnasium.make("CartPole-v1", max_episode_steps=max_steps)
+        else:
+            env = gymnasium.make("CartPole-v1")
 
-        def close_monkeypatch():
-            logging.info(f"Terminating spine {shm_name} with {pid=}...")
-            os.kill(pid, signal.SIGINT)  # interrupt spine child process
-            os.waitpid(pid, 0)  # wait for spine to terminate
-            velocity_env._prepatch_close()
-
-        velocity_env.close = close_monkeypatch
-        env = wrap_velocity_env(velocity_env, env_settings, training=True)
+        env.reset(seed=seed)
+        # Wrap with Monitor for SB3 logging
         return Monitor(env)
 
     set_random_seed(seed)
@@ -242,54 +203,34 @@ def find_save_path(training_dir: str, policy_name: str):
 
 
 def affine_schedule(y_0: float, y_1: float) -> Callable[[float], float]:
-    """Affine schedule as a function over the [0, 1] interval.
-
-    Args:
-        y_0 Function value at zero.
-        y_1 Function value at one.
-
-    Returns:
-        Corresponding affine function.
-    """
     diff = y_1 - y_0
 
     def schedule(x: float) -> float:
-        """Compute the current learning rate from remaining progress.
-
-        Args:
-            x: Progress decreasing from 1 (beginning) to 0.
-
-        Returns:
-            Corresponding learning rate.
-        """
         return y_0 + x * diff
 
     return schedule
 
 
-def train_policy(
-    policy_name: str,
-    nb_envs: int,
-    show: bool,
-) -> None:
-    """Train a new policy and save it to a directory.
+class DummyRunfiles:
+    def Rlocation(self, path):
+        if path.startswith("ppo_balancer/"):
+            return path.replace("ppo_balancer/", "", 1)
+        return path
 
-    Args:
-        policy_name: Name of the trained policy.
-        nb_envs: Number of environments, each running in a separate process.
-        show: Whether to show the simulation GUI.
-    """
+
+def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
     date = datetime.datetime.now().strftime("%Y-%m-%d")
     training_dir = Path(TRAINING_PATH) / date
     logging.info("Logging training data in %s", training_dir)
-    logging.info(
-        "To track in TensorBoard, run "
-        f"`tensorboard --logdir {training_dir}`"
-    )
+    logging.info("To track in TensorBoard, run " f"`tensorboard --logdir {training_dir}`")
     today_path = Path(TRAINING_PATH) / "today"
-    if today_path.exists():
-        today_path.unlink()
     target_path = Path(TRAINING_PATH) / date
+    # ensure today symlink points to today's directory
+    today_path.unlink(missing_ok=True)
+    try:
+        target_path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     today_path.symlink_to(target_path)
 
     if policy_name == "":
@@ -297,25 +238,25 @@ def train_policy(
     logging.info('New policy name is "%s"', policy_name)
 
     training = TrainingSettings()
-    deez_runfiles = runfiles.Create()
-    spine_path = Path(agent_dir) / deez_runfiles.Rlocation(
-        "upkie/spines/bullet_spine"
-    )
+    deez_runfiles = DummyRunfiles()
+    # spine_path not used in this no-pybullet variant; keep variable for compatibility
+    spine_path = ""
 
-    vec_env = (
-        SubprocVecEnv(
+    # Create vectorized environments (CartPole fallback)
+    if nb_envs > 1:
+        vec_env = SubprocVecEnv(
             [
                 init_env(
                     max_episode_duration=training.max_episode_duration,
                     show=show,
                     spine_path=spine_path,
                 )
-                for i in range(nb_envs)
+                for _ in range(nb_envs)
             ],
             start_method="fork",
         )
-        if nb_envs > 1
-        else DummyVecEnv(
+    else:
+        vec_env = DummyVecEnv(
             [
                 init_env(
                     max_episode_duration=training.max_episode_duration,
@@ -324,15 +265,16 @@ def train_policy(
                 )
             ]
         )
-    )
 
     env_settings = EnvSettings()
-    dt = 1.0 / env_settings.agent_frequency
+    # dt/gamma calculation: if agent_frequency not present in fallback, use default
+    try:
+        dt = 1.0 / env_settings.agent_frequency
+    except Exception:
+        dt = 1.0 / 50.0
     gamma = 1.0 - dt / training.return_horizon
     logging.info(
-        "Discount factor gamma=%f for a return horizon of %f s",
-        gamma,
-        training.return_horizon,
+        "Discount factor gamma=%f for a return horizon of %f s", gamma, training.return_horizon
     )
 
     ppo_settings = PPOSettings()
@@ -357,7 +299,7 @@ def train_policy(
         use_sde=ppo_settings.use_sde,
         sde_sample_freq=ppo_settings.sde_sample_freq,
         target_kl=ppo_settings.target_kl,
-        tensorboard_log=training_dir,
+        tensorboard_log=str(training_dir),
         policy_kwargs={
             "activation_fn": nn.Tanh,
             "net_arch": {
@@ -377,29 +319,29 @@ def train_policy(
             total_timesteps=training.total_timesteps,
             callback=[
                 CheckpointCallback(
-                    save_freq=max(210_000 // nb_envs, 1_000),
+                    save_freq=max(210_000 // max(nb_envs, 1), 1_000),
                     save_path=save_path,
                     name_prefix="checkpoint",
                 ),
-                SummaryWriterCallback(vec_env, save_path),
+                SummaryWriterCallback(vec_env, str(save_path)),
                 InitRandomizationCallback(
                     vec_env,
                     "pitch",
-                    training.init_rand["pitch"],
+                    training.init_rand.get("pitch", 0.0),
                     start_timestep=0,
                     end_timestep=1e5,
                 ),
                 InitRandomizationCallback(
                     vec_env,
                     "v_x",
-                    training.init_rand["v_x"],
+                    training.init_rand.get("v_x", 0.0),
                     start_timestep=0,
                     end_timestep=1e5,
                 ),
                 InitRandomizationCallback(
                     vec_env,
                     "omega_y",
-                    training.init_rand["omega_y"],
+                    training.init_rand.get("omega_y", 0.0),
                     start_timestep=0,
                     end_timestep=1e5,
                 ),
@@ -413,24 +355,23 @@ def train_policy(
     # Save policy no matter what!
     os.makedirs(save_path, exist_ok=True)
     policy.save(f"{save_path}/final.zip")
-    policy.env.close()
-    write_policy_makefile(save_path)
-    deploy_policy(save_path)
+    try:
+        policy.env.close()
+    except Exception:
+        pass
+    write_policy_makefile(str(save_path))
+    deploy_policy(str(save_path))
 
 
 def deploy_policy(policy_path: str):
     deployment_path = Path(TRAINING_PATH).parent / "policy"
-    logging.info(
-        "Deploying policy from %s to %s", policy_path, deployment_path
-    )
-    shutil.copy(
-        f"{policy_path}/final.zip",
-        f"{TRAINING_PATH}/../policy/params.zip",
-    )
-    shutil.copy(
-        f"{policy_path}/operative_config.gin",
-        f"{TRAINING_PATH}/../policy/operative_config.gin",
-    )
+    logging.info("Deploying policy from %s to %s", policy_path, deployment_path)
+    os.makedirs(deployment_path, exist_ok=True)
+    shutil.copy(f"{policy_path}/final.zip", f"{deployment_path}/params.zip")
+    # operative_config.gin may not exist in some cases; copy if present
+    gin_path_src = Path(policy_path) / "operative_config.gin"
+    if gin_path_src.exists():
+        shutil.copy(str(gin_path_src), f"{deployment_path}/operative_config.gin")
 
 
 def write_policy_makefile(policy_path: str):
@@ -452,9 +393,9 @@ deploy:
 if __name__ == "__main__":
     args = parse_command_line_arguments()
     agent_dir = Path(__file__).parent.parent
-    gin.parse_config_file(str(agent_dir / "config.gin"))
-    train_policy(
-        args.name,
-        nb_envs=args.nb_envs,
-        show=args.show,
-    )
+    # keep gin parsing if you have a config.gin; otherwise this will error
+    try:
+        gin.parse_config_file(str(agent_dir / "config.gin"))
+    except Exception:
+        logging.info("No config.gin parsed (missing or invalid); continuing with defaults.")
+    train_policy(args.name, nb_envs=args.nb_envs, show=args.show)

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2022 Stéphane Caron
-# Copyright 2023 Inria
 
 import argparse
 import logging
@@ -23,13 +19,7 @@ from wrap_velocity_env import wrap_velocity_env
 
 upkie.envs.register()
 
-
 def parse_command_line_arguments() -> argparse.Namespace:
-    """Parse command line arguments.
-
-    Returns:
-        Command-line arguments.
-    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "policy",
@@ -44,58 +34,77 @@ def parse_command_line_arguments() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-def get_tip_state(
-    observation, tip_height: float = 0.58
-) -> Tuple[float, float]:
-    """Compute the state of the virtual tip used in the agent's reward.
-
-    This extra info is for logging only.
-
-    Args:
-        observation Observation vector.
-        tip_height Height of the virtual tip.
-
-    Returns:
-        Pair of tip (position, velocity) in the sagittal plane.
+def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
     """
-    pitch = observation[0]
-    ground_position = observation[1]
-    angular_velocity = observation[2]
-    ground_velocity = observation[3]
-    tip_position = ground_position + tip_height * np.sin(pitch)
-    tip_velocity = ground_velocity + tip_height * angular_velocity * np.cos(
-        pitch
-    )
-    return tip_position, tip_velocity
-
-
-def run_policy(env: gym.Wrapper, policy) -> None:
-    """Run the policy on a given environment.
-
-    Args:
-        env: Upkie environment, wrapped by the agent.
-        policy: MLP policy to follow.
+    Run one episode with a specific lateral force.
+    Returns: True if successful (did not fall), False otherwise.
     """
-    action = np.zeros(env.action_space.shape)
     observation, info = env.reset()
-    while True:
-        action, _ = policy.predict(observation, deterministic=True)
-        tip_position, tip_velocity = get_tip_state(observation[-1])
-        env.unwrapped.log("action", action)
-        env.unwrapped.log("observation", observation[-1])
-        observation, _, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            observation, info = env.reset()
+    
+    # Simulation parameters
+    dt = env.unwrapped.dt
+    simtime = 0.0
+    
+    # Force parameters
+    FORCE_DURATION = 1.0  # Duration of the push
+    RAMP_DURATION = 0.2   # Time to reach full force (prevents physics crashes)
+    force_active = True
+    success = True
+    
+    # History for logging
+    pitches = []
 
+    while True:
+        # 1. Predict Action using the PPO Policy
+        action, _ = policy.predict(observation, deterministic=True)
+
+        # 2. Handle External Force (Sagittal Push)
+        if force_active and simtime < FORCE_DURATION:
+            # Linear Ramp-up to avoid "exploding" the simulation with sudden 20N
+            current_scale = min(simtime / RAMP_DURATION, 1.0)
+            current_force = force_magnitude * current_scale
+            
+            env.unwrapped.set_bullet_action({
+                "external_forces": {
+                    "base": {
+                        "force": [current_force, 0.0, 0.0], # X axis = Sagittal
+                        "position": [0.0, 0.0, 0.0],
+                    }
+                }
+            })
+        elif force_active:
+            # Stop applying force after duration
+            env.unwrapped.set_bullet_action({})
+            force_active = False
+
+        # 3. Step the environment
+        observation, _, terminated, truncated, info = env.step(action)
+        simtime += dt
+
+        # 4. Check for Fall
+        # PPO observations are often stacked. We need the latest one [-1]
+        # Index 0 is usually Pitch in Upkie environments
+        latest_obs = observation[-1] if len(observation.shape) > 1 else observation
+        pitch = latest_obs[0]
+        pitches.append(pitch)
+
+        # Failure condition (Fall detected)
+        if pitch >= 1.0 or pitch <= -1.0: # ~1.0 rad is a clear fall
+            success = False
+            break
+
+        if terminated or truncated:
+            success = False
+            break
+            
+        # Success condition: Survived the force + stabilization time
+        if not force_active and simtime > FORCE_DURATION + 2.0:
+            success = True
+            break
+
+    return success
 
 def main(policy_path: str, training: bool) -> None:
-    """Load environment and policy, and run the latter on the former.
-
-    Args:
-        policy_path: Path to policy parameters.
-        training: If True, add training noise and domain randomization.
-    """
     env_settings = EnvSettings()
     init_state = None
     if training:
@@ -105,6 +114,8 @@ def main(policy_path: str, training: bool) -> None:
                 **training_settings.init_rand
             ),
         )
+    
+    # Create the environment
     with gym.make(
         env_settings.env_id,
         frequency=env_settings.agent_frequency,
@@ -118,6 +129,8 @@ def main(policy_path: str, training: bool) -> None:
             env_settings,
             training=training,
         )
+        
+        # Load the PPO Policy
         ppo_settings = PPOSettings()
         policy = PPO(
             "MlpPolicy",
@@ -131,8 +144,31 @@ def main(policy_path: str, training: bool) -> None:
             verbose=0,
         )
         policy.set_parameters(policy_path)
-        run_policy(env, policy)
 
+        # --- MAIN TEST LOOP (1N to 20N) ---
+        print("Starting Sagittal Force Test (1N to 20N)...")
+        results = []
+        
+        # Range from 1 to 20 (inclusive)
+        for force in range(1, 21):
+            print(f"\nTesting Force: {force} N...")
+            
+            # Run the episode
+            is_success = run_episode(env, policy, float(force))
+            
+            # Log result
+            status = "Success" if is_success else "Failure"
+            print(f"Result: {force} N -> {status}")
+            results.append((force, is_success))
+            
+            # Optional: Stop testing if the robot fails to save time?
+            # if not is_success:
+            #     print("Robot failed. Stopping tests.")
+            #     break
+        
+        print("\n--- Final Summary ---")
+        for f, s in results:
+            print(f"Force {f:2} N : {'[PASS]' if s else '[FAIL]'}")
 
 if __name__ == "__main__":
     if on_raspi():

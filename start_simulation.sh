@@ -12,7 +12,7 @@ ARCH=$(uname -m)
 
 SPINE_ARGS=()
 if [ $# -eq 0 ]; then
-    SPINE_ARGS=("--show")
+    SPINE_ARGS=()
 else
     SPINE_ARGS=("$@")
 fi

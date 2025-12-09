@@ -46,9 +46,12 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
     dt = env.unwrapped.dt
     simtime = 0.0
     
+
     # Force parameters
     FORCE_DURATION = 1.0  # Duration of the push
     RAMP_DURATION = 0.2   # Time to reach full force (prevents physics crashes)
+    TIME_BEFORE_FORCE =1
+    TIME_AFTER_FORCE = 5
     force_active = True
     success = True
     
@@ -58,7 +61,10 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
     while True:
         # 1. Predict Action using the PPO Policy
         action, _ = policy.predict(observation, deterministic=True)
-
+        is_in_force_window = (
+            simtime > TIME_BEFORE_FORCE and 
+            simtime < TIME_BEFORE_FORCE + FORCE_DURATION
+            )
         # 2. Handle External Force (Sagittal Push)
         if force_active and simtime < FORCE_DURATION:
             # Linear Ramp-up to avoid "exploding" the simulation with sudden 20N
@@ -68,8 +74,8 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
             env.unwrapped.set_bullet_action({
                 "external_forces": {
                     "base": {
-                        "force": [current_force, 0.0, 0.0], # X axis = Sagittal
-                        "position": [0.0, 0.0, 0.0],
+                        "force": [current_force, 0.0, 0.0],  # push forward 
+                        "position" : [0.0,0.,0.]        # push at the top
                     }
                 }
             })
@@ -77,6 +83,16 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
             # Stop applying force after duration
             env.unwrapped.set_bullet_action({})
             force_active = False
+        elif is_in_force_window:
+            force_active = True
+            env.unwrapped.set_bullet_action({
+                "external_forces": {
+                    "base": {
+                        "force": [current_force, 0.0, 0.0],
+                        "position": [0., 0., 0.]
+                    }
+                }
+            })
 
         # 3. Step the environment
         observation, _, terminated, truncated, info = env.step(action)
@@ -90,7 +106,7 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
         pitches.append(pitch)
 
         # Failure condition (Fall detected)
-        if pitch >= 1.0 or pitch <= -1.0: # ~1.0 rad is a clear fall
+        if pitch >= np.pi/6 or pitch <= -np.pi/6: # ~1.0 rad is a clear fall
             success = False
             break
 
@@ -99,7 +115,7 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
             break
             
         # Success condition: Survived the force + stabilization time
-        if not force_active and simtime > FORCE_DURATION + 2.0:
+        if not force_active and simtime > FORCE_DURATION + TIME_AFTER_FORCE + TIME_BEFORE_FORCE:
             success = True
             break
 
@@ -115,7 +131,6 @@ def main(policy_path: str, training: bool) -> None:
                 **training_settings.init_rand
             ),
         )
-    
     # Create the environment
     with gym.make(
         env_settings.env_id,

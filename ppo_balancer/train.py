@@ -218,10 +218,10 @@ class SummaryWriterCallback(BaseCallback):
         logging.info(f"Saved gin configuration to {gin_path}")
         return True
 
-def get_random_word():
-    adjectives = ["agile", "balanced", "bold", "clever", "daring", "fast", "fierce"]
-    nouns = ["agent", "balancer", "bot", "controller", "droid", "walker"]
-    return f"{random.choice(adjectives)}_{random.choice(nouns)}_{random.randint(100, 999)}"
+def get_date_string():
+    """Return a string like '2025-12-09_1530' for naming purposes."""
+    now = datetime.datetime.now()
+    return "Traning-"+ now.strftime("%Y-%m-%d_%H%M")
 
 def get_bullet_argv(shm_name: str, show: bool) -> List[str]:
     env_settings = EnvSettings()
@@ -241,7 +241,7 @@ def init_env(max_episode_duration: float, show: bool, spine_path: str):
     seed = random.randint(0, 1_000_000)
 
     def _init():
-        shm_name = f"/{get_random_word()}"
+        shm_name = f"/{get_date_string()}"
         pid = os.fork()
         if pid == 0:  # child process: spine
             argv = get_bullet_argv(shm_name, show=show)
@@ -303,7 +303,7 @@ def affine_schedule(y_0: float, y_1: float) -> Callable[[float], float]:
 def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
     date = datetime.datetime.now().strftime("%Y-%m-%d")
     training_dir = Path(TRAINING_PATH) / date
-    if policy_name == "": policy_name = get_random_word()
+    if policy_name == "": policy_name = get_date_string()
     
     training = TrainingSettings()
     deez_runfiles = runfiles.Create()

@@ -22,9 +22,10 @@ upkie.envs.register()
 def parse_command_line_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "policy",
-        nargs="?",
-        help="path to the policy parameters file",
+        "--policy",
+        default=None,
+        help="Path to the policy parameters file (e.g., 'path/to/policy'). "
+             "If not provided, defaults to '../policy/params'.",
     )
     parser.add_argument(
         "--training",

@@ -22,7 +22,6 @@ import gymnasium
 import numpy as np
 import stable_baselines3
 import upkie.envs
-from define_reward import DefineReward
 from rules_python.python.runfiles import runfiles
 from settings import EnvSettings, PPOSettings, TrainingSettings
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -43,6 +42,63 @@ from ppo_balancer.wrapper import NewWrapper
 upkie.envs.register()
 
 TRAINING_PATH = os.environ.get("UPKIE_TRAINING_PATH", tempfile.gettempdir())
+
+import gymnasium as gym
+import numpy as np
+
+class DefineReward(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.sigma_pitch = 0.15
+        self.weight_velocity = 0.1 
+        self.weight_action = 0.1
+        
+        # Initialize memory for "Action Change Penalty"
+        self.last_action = None
+        
+        # Initialize logs so train.py doesn't crash
+        self.last_position_reward = 0.0
+        self.last_velocity_penalty = 0.0
+        self.last_action_change_penalty = 0.0
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        # 1. Extract from NewWrapper Observation (12 dims)
+        # Index 0 = Pitch
+        # Index 3 = Ground Velocity
+        pitch = obs[0]
+        ground_vel = obs[3]
+
+        # 2. Calculate Components
+        # Position: Bell curve around 0
+        pos_reward = np.exp(- (pitch**2) / (2 * self.sigma_pitch**2))
+        
+        # Velocity: Penalize moving fast
+        vel_penalty = -1.0 * abs(ground_vel)
+        
+        # Action: Penalize twitching
+        if self.last_action is not None:
+            act_penalty = -1.0 * np.sum(np.abs(action - self.last_action))
+        else:
+            act_penalty = 0.0
+        self.last_action = action.copy()
+
+        # 3. Save for TensorBoard (train.py reads these!)
+        self.last_position_reward = pos_reward
+        self.last_velocity_penalty = vel_penalty
+        self.last_action_change_penalty = act_penalty
+
+        # 4. Add to existing reward (Alive Bonus from wrapper.py)
+        # We multiply by weights here
+        total_reward = (
+            reward + 
+            pos_reward + 
+            (self.weight_velocity * vel_penalty) + 
+            (self.weight_action * act_penalty)
+        )
+
+        return obs, total_reward, terminated, truncated, info
 
 def cleanup(vec_env):
     try:

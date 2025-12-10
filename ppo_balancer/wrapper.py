@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 from upkie.envs.upkie_servos import UpkieServos
+from upkie.utils.clamp import clamp_and_warn
 
 class NewWrapper(gym.Wrapper):
     """
@@ -48,6 +49,7 @@ class NewWrapper(gym.Wrapper):
             shape=(obs_dim,), 
             dtype=np.float32
         )
+        self.fall_pitch = 1.0  
 
         self.leg_joints = ['left_hip', 'left_knee', 'right_hip', 'right_knee']
 
@@ -65,6 +67,12 @@ class NewWrapper(gym.Wrapper):
         right_knee_cmd = action[3]
         ground_vel_cmd = action[4]
 
+        ground_vel_cmd = clamp_and_warn(
+                    raw_ground_vel,
+                    -2.0,  # Min limit
+                    2.0,   # Max limit
+                    label="ground_velocity"
+                )
         # 2. Wheel Kinematics
         wheel_omega = ground_vel_cmd / self.wheel_radius
         left_wheel_sign = 1.0 if self.left_wheeled else -1.0
@@ -89,9 +97,21 @@ class NewWrapper(gym.Wrapper):
         env_action['right_wheel']['velocity'] = float(right_wheel_vel)
 
         # 4. Step
-        _, reward, terminated, truncated, info = self.env.step(env_action)
+        # 2. Step the internal environment
+        # Note: UpkieServos always returns terminated=False by default
+        obs_dict, reward, terminated, truncated, info = self.env.step(env_action)
+        
+        # 3. Process Observation
         obs = self._get_observation(info['spine_observation'])
 
+        # --- 4. NEW: FALL DETECTION ---
+        # We extract pitch from the observation (Index 0 in our vector)
+        pitch = obs[0] 
+        
+        # If pitch is too high, we force the episode to end
+        if abs(pitch) > self.fall_pitch:
+            terminated = True
+            
         return obs, reward, terminated, truncated, info
 
     def _get_observation(self, spine_obs):

@@ -37,8 +37,11 @@ from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from torch import nn
 from upkie.utils.spdlog import logging
 from wrap_velocity_env import wrap_velocity_env
+from ppo_balancer.wrappers import NewWrapper
 
 upkie.envs.register()
+
+env = NewWrapper(upkie.envs.UpkieServos(frequency=200.0))
 
 def cleanup(vec_env):
     try:

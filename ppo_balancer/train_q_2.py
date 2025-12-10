@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, List
 import importlib.util
 
+import upkie
 import gin
 import gymnasium
 import numpy as np
@@ -33,6 +34,11 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from torch import nn
 from upkie.utils.spdlog import logging
+from ppo_balancer.wrapper import NewWrapper
+
+upkie.envs.register()
+
+
 
 TRAINING_PATH = os.environ.get("UPKIE_TRAINING_PATH", tempfile.gettempdir())
 
@@ -177,14 +183,11 @@ def init_env(max_episode_duration: float, show: bool, spine_path: str = ""):
         except Exception:
             max_steps = None
 
-        # Create CartPole with a max_episode_steps override when possible
-        if max_steps is not None:
-            # Gymnasium accepts max_episode_steps as an argument to make
-            env = gymnasium.make("CartPole-v1", max_episode_steps=max_steps)
-        else:
-            env = gymnasium.make("CartPole-v1")
+
+        env = NewWrapper(upkie.envs.UpkieServos(frequency=agent_frequency))
 
         env.reset(seed=seed)
+        env = DefineReward(env)
         # Wrap with Monitor for SB3 logging
         return Monitor(env)
 
@@ -210,6 +213,28 @@ def affine_schedule(y_0: float, y_1: float) -> Callable[[float], float]:
 
     return schedule
 
+class LogJointsCallback(BaseCallback):
+    """
+    Callback for logging specific observation values (like joint angles) to TensorBoard.
+    Assumes observation order from NewWrapper:
+    [Pitch, GroundPos, PitchRate, GroundVel, L_Hip, L_Knee, R_Hip, R_Knee, ...]
+    """
+    def _on_step(self) -> bool:
+        # Access the observations from the rollout buffer
+        # 'new_obs' contains the observation returned by the env in the last step
+        obs = self.locals['new_obs']
+        
+        # Check wrappers.py for these indices:
+        # Index 0: Pitch
+        # Index 3: Ground Velocity
+        # Index 5: Left Knee Position
+        
+        # Log average values across parallel environments
+        self.logger.record("telemetry/pitch_angle", np.mean(obs[:, 0]))
+        self.logger.record("telemetry/ground_velocity", np.mean(obs[:, 3]))
+        self.logger.record("telemetry/left_knee_angle", np.mean(obs[:, 5]))
+        
+        return True
 
 class DummyRunfiles:
     def Rlocation(self, path):
@@ -346,6 +371,7 @@ def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
                     end_timestep=1e5,
                 ),
                 RewardCallback(vec_env),
+                LogJointsCallback(),
             ],
             tb_log_name=policy_name,
         )

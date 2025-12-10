@@ -7,4 +7,4 @@ cache/
 env/
 environment.tar
 tools/bazel
-training/
+

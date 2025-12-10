@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2023 Inria
 
-# Q3
+# Q4
 
 import argparse
 import datetime
@@ -36,7 +36,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from torch import nn
 from upkie.utils.spdlog import logging
-from wrap_velocity_env import wrap_velocity_env
+from upkie.envs import UpkieServos  # 
+from ppo_balancer.wrap_servos_env import UpkieServosWrapper, ServosReward  # Import your new file
 
 upkie.envs.register()
 
@@ -105,16 +106,7 @@ class ForceLearningWrapper(gymnasium.Wrapper):
 # NEW: Force Curriculum Callback
 # =============================================================================
 class ForceCurriculumCallback(BaseCallback):
-    """
-    Linearly increases the max_force applied to the robot over time.
-    """
-    def __init__(
-        self,
-        vec_env: VecEnv,
-        target_max_force: float,
-        start_timestep: int,
-        end_timestep: int,
-    ):
+    def __init__(self, vec_env: VecEnv, target_max_force: float, start_timestep: int, end_timestep: int):
         super().__init__()
         self.vec_env = vec_env
         self.target_max_force = target_max_force
@@ -122,24 +114,18 @@ class ForceCurriculumCallback(BaseCallback):
         self.end_timestep = end_timestep
 
     def _on_step(self) -> bool:
-        # 1. Calculate progress (0.0 to 1.0)
         if self.num_timesteps < self.start_timestep:
             progress = 0.0
         else:
             progress = np.clip(
                 (self.num_timesteps - self.start_timestep) / (self.end_timestep - self.start_timestep),
-                0.0,
-                1.0,
+                0.0, 1.0
             )
         
-        # 2. Calculate current difficulty
         current_max = progress * self.target_max_force
         
-        # 3. Update the environment
-        # We use env_method to reach into the ForceLearningWrapper inside the SubprocVecEnv
+        # The method "set_max_force" now exists directly in UpkieServosWrapper
         self.vec_env.env_method("set_max_force", max_force=current_max)
-        
-        # 4. Log
         self.logger.record("curriculum/max_force", current_max)
         return True
 
@@ -243,21 +229,18 @@ def init_env(max_episode_duration: float, show: bool, spine_path: str):
     def _init():
         shm_name = f"/{get_random_word()}"
         pid = os.fork()
-        if pid == 0:  # child process: spine
+        if pid == 0:  # spine process
             argv = get_bullet_argv(shm_name, show=show)
             os.execvp(spine_path, ["bullet"] + argv)
             return
 
-        # parent process: trainer
         agent_frequency = env_settings.agent_frequency
         velocity_env = gymnasium.make(
-            env_settings.env_id,
-            max_episode_steps=int(max_episode_duration * agent_frequency),
+            "UpkieServos-v5", 
             frequency=agent_frequency,
-            regulate_frequency=False,
             shm_name=shm_name,
             spine_config=env_settings.spine_config,
-            max_ground_velocity=env_settings.max_ground_velocity,
+            regulate_frequency=False,
         )
         velocity_env.reset(seed=seed)
         velocity_env._prepatch_close = velocity_env.close
@@ -273,12 +256,11 @@ def init_env(max_episode_duration: float, show: bool, spine_path: str):
 
         velocity_env.close = close_monkeypatch
         
-        # 1. Standard Wrapper
-        env = wrap_velocity_env(velocity_env, env_settings, training=True)
+        # 1. Main Wrapper (Now handles Forces too)
+        env = UpkieServosWrapper(velocity_env)
         
-        # 2. NEW: Force Learning Wrapper
-        # We wrap the "wrapped" env again to add physics noise
-        env = ForceLearningWrapper(env, max_force=0.0) 
+        # 2. Reward
+        env = ServosReward(env)
         
         return Monitor(env)
 

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2023 Inria
 
-# Q4
+# Q3
 
 import argparse
 import datetime
@@ -357,7 +357,7 @@ def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
     TOTAL_STEPS = training.total_timesteps
     FORCE_START = 400_000
     FORCE_END = 800_000 # Ramps up force from 100k to 400k steps
-    MAX_TRAIN_FORCE = 5.0 # Newtons (A bit lower than max test force to ensure stability)
+    MAX_TRAIN_FORCE = 12.0 # Newtons (A bit lower than max test force to ensure stability)
 
     try:
         policy.learn(

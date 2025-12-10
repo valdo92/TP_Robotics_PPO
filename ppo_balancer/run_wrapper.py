@@ -12,11 +12,14 @@ import numpy as np
 import upkie.envs
 from settings import EnvSettings, PPOSettings, TrainingSettings
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize # <--- ADDED
 from upkie.utils.raspi import configure_agent_process, on_raspi
 from upkie.utils.robot_state import RobotState
 from upkie.utils.robot_state_randomization import RobotStateRandomization
-from wrap_velocity_env import wrap_velocity_env
+
+# --- IMPORT YOUR WRAPPER ---
 from ppo_balancer.wrapper import NewWrapper 
+from upkie.envs import UpkieServos # Import the base env class directly
 
 upkie.envs.register()
 
@@ -25,8 +28,7 @@ def parse_command_line_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--policy",
         default=None,
-        help="Path to the policy parameters file (e.g., 'path/to/policy'). "
-             "If not provided, defaults to '../policy/params'.",
+        help="Path to the policy parameters file.",
     )
     parser.add_argument(
         "--training",
@@ -41,18 +43,19 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
     Run one episode with a specific lateral force.
     Returns: True if successful (did not fall), False otherwise.
     """
-    observation, info = env.reset()
+    # Reset returns (obs, info)
+    observation = env.reset() # In VecEnv, this returns just obs
     
     # Simulation parameters
-    dt = env.unwrapped.dt
+    # Note: env is a VecEnv now, so we access the first env
+    dt = env.envs[0].unwrapped.dt 
     simtime = 0.0
     
-
     # Force parameters
     FORCE_DURATION = 1.0  # Duration of the push
-    RAMP_DURATION = 0.2   # Time to reach full force (prevents physics crashes)
-    TIME_BEFORE_FORCE =1
-    TIME_AFTER_FORCE = 5
+    RAMP_DURATION = 0.2   # Time to reach full force
+    TIME_BEFORE_FORCE = 1.0
+    TIME_AFTER_FORCE = 5.0
     force_active = True
     success = True
     
@@ -62,57 +65,61 @@ def run_episode(env: gym.Wrapper, policy, force_magnitude: float) -> bool:
     while True:
         # 1. Predict Action using the PPO Policy
         action, _ = policy.predict(observation, deterministic=True)
+        
         is_in_force_window = (
             simtime > TIME_BEFORE_FORCE and 
             simtime < TIME_BEFORE_FORCE + FORCE_DURATION
-            )
+        )
+        
         # 2. Handle External Force (Sagittal Push)
-        if force_active and simtime < FORCE_DURATION:
-            # Linear Ramp-up to avoid "exploding" the simulation with sudden 20N
-            current_scale = min(simtime / RAMP_DURATION, 1.0)
-            current_force = force_magnitude * current_scale
-            
-            env.unwrapped.set_bullet_action({
-                "external_forces": {
-                    "base": {
-                        "force": [current_force, 0.0, 0.0],  # push forward 
-                        "position" : [0.0,0.,0.]        # push at the top
+        # We must access env.envs[0].unwrapped to reach the Bullet core
+        bullet_env = env.envs[0].unwrapped 
+
+        if force_active and simtime < FORCE_DURATION + TIME_BEFORE_FORCE:
+            if is_in_force_window:
+                # Linear Ramp-up
+                elapsed_push = simtime - TIME_BEFORE_FORCE
+                current_scale = min(elapsed_push / RAMP_DURATION, 1.0)
+                current_force = force_magnitude * current_scale
+                
+                bullet_env.set_bullet_action({
+                    "external_forces": {
+                        "base": {
+                            "force": [current_force, 0.0, 0.0],  # push forward 
+                            "position" : [0.0, 0.0, 0.0]        # push at the center
+                        }
                     }
-                }
-            })
+                })
         elif force_active:
             # Stop applying force after duration
-            env.unwrapped.set_bullet_action({})
+            bullet_env.set_bullet_action({})
             force_active = False
-        elif is_in_force_window:
-            force_active = True
-            env.unwrapped.set_bullet_action({
-                "external_forces": {
-                    "base": {
-                        "force": [current_force, 0.0, 0.0],
-                        "position": [0., 0., 0.]
-                    }
-                }
-            })
 
         # 3. Step the environment
-        observation, _, terminated, truncated, info = env.step(action)
+        # VecEnv step returns: obs, reward, done, info
+        observation, _, done, info = env.step(action)
         simtime += dt
 
         # 4. Check for Fall
-        # PPO observations are often stacked. We need the latest one [-1]
-        # Index 0 is usually Pitch in Upkie environments
-        latest_obs = observation[-1] if len(observation.shape) > 1 else observation
-        pitch = latest_obs[0]
+        # VecEnv observations are shape (1, 12), we want the first row
+        latest_obs = observation[0]
+        
+        # In NewWrapper, Index 0 is Pitch
+        pitch = latest_obs[0] 
         pitches.append(pitch)
 
         # Failure condition (Fall detected)
-        if pitch >= np.pi/6 or pitch <= -np.pi/6: # ~1.0 rad is a clear fall
+        if abs(pitch) > 1.0: # ~57 degrees
             success = False
             break
 
-        if terminated or truncated:
-            success = False
+        # In VecEnv, 'done' is an array of booleans
+        if done[0]:
+            # If it reset automatically, check why. 
+            # If pitch was high, it failed. If time ran out, it might be success.
+            # But usually we break manually on pitch before this.
+            if abs(pitch) > 1.0:
+                success = False
             break
             
         # Success condition: Survived the force + stabilization time
@@ -132,21 +139,28 @@ def main(policy_path: str, training: bool) -> None:
                 **training_settings.init_rand
             ),
         )
-    # Create the environment
-    with gym.make(
-        env_settings.env_id,
+
+    # --- 1. Create Base Environment (UpkieServos) ---
+    # We use the raw class, not gym.make, to ensure we control the wrapping
+    base_env = UpkieServos(
         frequency=env_settings.agent_frequency,
         init_state=init_state,
         max_ground_velocity=env_settings.max_ground_velocity,
-        regulate_frequency=True,
+        regulate_frequency=True, # Real-time regulation for visualization
         spine_config=env_settings.spine_config,
-    ) as velocity_env:
-        env = wrap_velocity_env(
-            velocity_env,
-            env_settings,
-            training=training,
-        )
-        
+    )
+
+    # --- 2. Apply Your New Wrapper ---
+    env = NewWrapper(base_env)
+
+    # --- 3. Vectorize & Normalize ---
+    # We must replicate the training architecture (VecNormalize)
+    # norm_reward=False because we don't care about rewards during testing
+    # training=False stops it from updating statistics (uses default or loaded ones)
+    env = DummyVecEnv([lambda: env])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
+
+    try:
         # Load the PPO Policy
         ppo_settings = PPOSettings()
         policy = PPO(
@@ -178,14 +192,17 @@ def main(policy_path: str, training: bool) -> None:
             print(f"Result: {force} N -> {status}")
             results.append((force, is_success))
             
-            # Optional: Stop testing if the robot fails to save time?
-            # if not is_success:
-            #     print("Robot failed. Stopping tests.")
-            #     break
+            # Optional: Stop testing if the robot fails to save time
+            if not is_success:
+                 print("Robot failed. Stopping tests.")
+                 break
         
         print("\n--- Final Summary ---")
         for f, s in results:
             print(f"Force {f:2} N : {'[PASS]' if s else '[FAIL]'}")
+            
+    finally:
+        env.close()
 
 if __name__ == "__main__":
     if on_raspi():
@@ -206,7 +223,10 @@ if __name__ == "__main__":
     # Configuration
     config_path = Path(policy_path).parent / "operative_config.gin"
     logging.info("Loading policy configuration from %s", config_path)
-    gin.parse_config_file(str(config_path))
+    try:
+        gin.parse_config_file(str(config_path))
+    except:
+        logging.info("Could not load config file, using defaults.")
 
     try:
         main(policy_path, args.training)

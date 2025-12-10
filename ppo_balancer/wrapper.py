@@ -65,8 +65,7 @@ class NewWrapper(gym.Wrapper):
         left_knee_cmd = action[1]
         right_hip_cmd = action[2]
         right_knee_cmd = action[3]
-        ground_vel_cmd = action[4]
-
+        raw_ground_vel = action[4]
         ground_vel_cmd = clamp_and_warn(
                     raw_ground_vel,
                     -2.0,  # Min limit
@@ -108,9 +107,17 @@ class NewWrapper(gym.Wrapper):
         # We extract pitch from the observation (Index 0 in our vector)
         pitch = obs[0] 
         
-        # If pitch is too high, we force the episode to end
-        if abs(pitch) > self.fall_pitch:
+# --- 5. FALL DETECTION ---
+        if abs(obs[0]) > self.fall_pitch:
             terminated = True
+            # Optional: Add a large penalty for falling to discourage suicide
+            reward -= 10.0 
+
+        # --- 6. FIX FOR QUESTION 4: ALIVE BONUS ---
+        # We add a constant +10.0 to every step. 
+        # Since your penalties are around -9.0, this makes the net reward +1.0.
+        # Now, living longer = more points.
+        reward += 10.0
             
         return obs, reward, terminated, truncated, info
 

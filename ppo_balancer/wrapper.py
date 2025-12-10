@@ -61,11 +61,15 @@ class NewWrapper(gym.Wrapper):
     def step(self, action):
         # 1. Unpack Action (Size 5)
         # Order must match action_space definition in __init__
-        left_hip_cmd = action[0]
-        left_knee_cmd = action[1]
-        right_hip_cmd = action[2]
-        right_knee_cmd = action[3]
-        raw_ground_vel = action[4]
+# PPO output: approx -1 to 1
+        # Scaled output: approx -0.25 to 0.25
+        left_hip_cmd = action[0] * 0.5   # Reduce hip range
+        right_hip_cmd = action[1] * 0.5 
+        raw_ground_vel = action[2] * 0.1 # <--- CRITICAL: Reduce initial wheel speed authority
+
+        # 2. Action Shaping (Knee = -2 * Hip)
+        left_knee_cmd = -2.0 * left_hip_cmd
+        right_knee_cmd = -2.0 * right_hip_cmd
         ground_vel_cmd = clamp_and_warn(
                     raw_ground_vel,
                     -2.0,  # Min limit
@@ -111,13 +115,13 @@ class NewWrapper(gym.Wrapper):
         if abs(obs[0]) > self.fall_pitch:
             terminated = True
             # Optional: Add a large penalty for falling to discourage suicide
-            reward -= 10.0 
+            reward -= 50.0 
 
         # --- 6. FIX FOR QUESTION 4: ALIVE BONUS ---
         # We add a constant +10.0 to every step. 
         # Since your penalties are around -9.0, this makes the net reward +1.0.
         # Now, living longer = more points.
-        reward += 10.0
+        reward += 50.0
             
         return obs, reward, terminated, truncated, info
 

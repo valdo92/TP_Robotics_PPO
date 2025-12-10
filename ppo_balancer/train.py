@@ -33,6 +33,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 from torch import nn
 from upkie.utils.spdlog import logging
+# Add this with your other imports
+from stable_baselines3.common.vec_env import VecNormalize
 
 # --- IMPORT YOUR WRAPPER ---
 # Make sure your file is named 'wrapper.py' and in the 'ppo_balancer' folder
@@ -150,11 +152,13 @@ class RewardCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         for term in ("position_reward", "velocity_penalty", "action_change_penalty"):
-             try:
-                 vals = self.vec_env.get_attr(f"last_{term}")
-                 self.logger.record(f"rewards/{term}", np.mean(vals))
-             except:
-                 pass
+            if hasattr(self.vec_env, "get_attr"):
+                 # Wrap in try/except or check if attr exists to be safe with SubProc
+                 try:
+                     vals = self.vec_env.get_attr(f"last_{term}")
+                     self.logger.record(f"rewards/{term}", np.mean(vals))
+                 except:
+                     pass
         return True
 
 class SummaryWriterCallback(BaseCallback):
@@ -322,7 +326,7 @@ def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
     # Phase 1: Learn to balance (0 to 200k)
     # Phase 2: Learn to resist forces (200k to 800k)
     TOTAL_STEPS = training.total_timesteps
-    FORCE_START = 200_000
+    FORCE_START = 400_000
     FORCE_END = 800_000
     MAX_TRAIN_FORCE = 12.0
 
@@ -332,9 +336,9 @@ def train_policy(policy_name: str, nb_envs: int, show: bool) -> None:
             callback=[
                 CheckpointCallback(save_freq=max(210_000 // nb_envs, 1_000), save_path=save_path, name_prefix="checkpoint"),
                 SummaryWriterCallback(vec_env, save_path),
-                InitRandomizationCallback(vec_env, "pitch", training.init_rand["pitch"], 0, 1e5),
-                InitRandomizationCallback(vec_env, "v_x", training.init_rand["v_x"], 0, 1e5),
-                InitRandomizationCallback(vec_env, "omega_y", training.init_rand["omega_y"], 0, 1e5),
+                InitRandomizationCallback(vec_env, "pitch", training.init_rand["pitch"], 2e5, 1e5),
+                InitRandomizationCallback(vec_env, "v_x", training.init_rand["v_x"], 2e5, 1e5),
+                InitRandomizationCallback(vec_env, "omega_y", training.init_rand["omega_y"], 2e5, 1e5),
                 
                 # Force Curriculum
                 ForceCurriculumCallback(
